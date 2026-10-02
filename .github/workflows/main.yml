@@ -1,0 +1,114 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    # FREE MAX SPEC: Automatically scales to 4 Cores / 16 GB RAM if the repository is PUBLIC
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Clear previous rules and optimize firewall for maximum RDP network throughput
+          netsh advfirewall firewall delete rule name="RDP-FreeMax" 2>$null
+          netsh advfirewall firewall add rule name="RDP-FreeMax" `
+            dir=in action=allow protocol=TCP localport=3389 profile=any
+
+          # Restart service to apply performance profiles
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          \$charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          \$rawPassword = @()
+          \(rawPassword +=\)charSet.Upper | Get-Random -Count 4
+          \(rawPassword +=\)charSet.Lower | Get-Random -Count 4
+          \(rawPassword +=\)charSet.Number | Get-Random -Count 4
+          \(rawPassword +=\)charSet.Special | Get-Random -Count 4
+          \(password = -join (\)rawPassword | Sort-Object { Get-Random })
+          \(securePass = ConvertTo-SecureString\)password -AsPlainText -Force
+          
+          New-LocalUser -Name "RDP" -Password \$securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          # Pass credentials safely to environment context
+          echo "RDP_PASS=\(password" >> \)env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          \$tsUrl = "https://tailscale.com"
+          \(installerPath = "\)env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri \(tsUrl -OutFile\)installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item \$installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Connect to Tailscale network using repository secret key
+          & "\$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=\({{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-maxfree-\)env:GITHUB_RUN_ID
+          
+          # Poll for active Tailscale IP assignment
+          \$tsIP = \(null\)retries = 0
+          while (-not \(tsIP -and\)retries -lt 10) {
+              \(tsIP = & "\)env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              \$retries++
+          }
+          
+          if (-not \$tsIP) {
+              Write-Error "Tailscale IP allocation failed."
+              exit 1
+          }
+          echo "TAILSCALE_IP=\(tsIP" >> \)env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP Target: \$env:TAILSCALE_IP"
+          
+          \(testResult = Test-NetConnection -ComputerName\)env:TAILSCALE_IP -Port 3389
+          if (-not \$testResult.TcpTestSucceeded) {
+              Write-Error "RDP network handshake failed on port 3389"
+              exit 1
+          }
+          Write-Host "Network channels verified successfully!"
+
+      - name: Maintain Active Connection
+        run: |
+          Write-Host "`n========================================="
+          Write-Host "=== FREE MAX-SPEC RDP ONLINE ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "Hardware Profile: 4 vCPU | 16 GB RAM (Public Repo Tier)"
+          Write-Host "=========================================`n"
+          
+          # Loop execution logic to maintain runner lifespan up to GitHub's 6-hour limit
+          while (\$true) {
+              Write-Host "[\$(Get-Date)] RDP Session Active - Keep open"
+              Start-Sleep -Seconds 300
+          }
